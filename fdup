@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""
+dupename.py – find duplicate files, optionally filtered by filename.
+
+Detection is done in three passes to minimise disk reads:
+  1. Group by file size  (free – no I/O beyond stat)
+  2. Partial SHA-256 of the first 64 KiB  (fast)
+  3. Full SHA-256 of the entire file  (exact)
+Each confirmed duplicate pair is also verified byte-for-byte with filecmp.
+
+────────────────────────────────────────────────────────────────────────────
+OUTPUT MODES  (mutually exclusive, default: --diff-names)
+────────────────────────────────────────────────────────────────────────────
+  --diff-names    Show only groups where filenames differ  ← default
+  --same-names    Show only groups where every copy has the same filename
+  --all           Show every duplicate group regardless of filename
+
+────────────────────────────────────────────────────────────────────────────
+EXAMPLES
+────────────────────────────────────────────────────────────────────────────
+Basic scan (default mode: diff-names):
+    python dupename.py /photos /backup
+
+Scan two directories, show ALL duplicates:
+    python dupename.py /photos /backup --all
+
+Only duplicates whose copies share the same filename:
+    python dupename.py /photos /backup --same-names
+
+Skip venv and .git folders:
+    python dupename.py /projects --exclude venv .venv .git
+
+Only JPEG/PNG files larger than 1 MB:
+    python dupename.py /photos --ext jpg png --min-size 1048576
+
+Only files smaller than 10 KB:
+    python dupename.py /docs --max-size 10240
+
+Case-sensitive filename comparison:
+    python dupename.py /data --diff-names --case-sensitive
+
+Export to CSV and JSON at the same time:
+    python dupename.py /photos --csv report.csv --json report.json
+
+Preview what would be deleted without touching anything (dry-run):
+    python dupename.py /photos --dry-run
+
+Interactively choose which copy to keep, delete the rest:
+    python dupename.py /photos --delete-interactive
+
+Same, but preview the choices first without deleting:
+    python dupename.py /photos --delete-interactive --dry-run
+
+Treat hardlinks as duplicates (they are skipped by default):
+    python dupename.py /data --keep-hardlinks
+
+────────────────────────────────────────────────────────────────────────────
+REQUIREMENTS
+────────────────────────────────────────────────────────────────────────────
+Python 3.11+  –  no third-party libraries required.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import filecmp
+import hashlib
+import json
+import os
+import sys
+
+from collections import defaultdict
+from pathlib import Path
+from typing import DefaultDict
+
+
+PARTIAL_HASH_SIZE = 64 * 1024
+
+
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while chunk := f.read(chunk_size):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def partial_hash(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        h.update(f.read(PARTIAL_HASH_SIZE))
+    return h.hexdigest()
+
+
+def scan_files(
+    roots: list[str],
+    exclude_dirs: set[str],
+    follow_symlinks: bool,
+    min_size: int | None,
+    max_size: int | None,
+    extensions: set[str] | None,
+) -> DefaultDict[int, list[Path]]:
+
+    by_size: DefaultDict[int, list[Path]] = defaultdict(list)
+    total = 0
+
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=follow_symlinks):
+            dirnames[:] = [d for d in dirnames if d not in exclude_dirs]
+
+            for filename in filenames:
+                path = Path(dirpath) / filename
+
+                try:
+                    if not follow_symlinks and path.is_symlink():
+                        continue
+
+                    if extensions:
+                        if path.suffix.lower().lstrip(".") not in extensions:
+                            continue
+
+                    size = path.stat().st_size
+
+                    if min_size is not None and size < min_size:
+                        continue
+
+                    if max_size is not None and size > max_size:
+                        continue
+
+                    by_size[size].append(path)
+                    total += 1
+
+                except OSError:
+                    continue
+
+    print(f"Scanned {total:,} files.", file=sys.stderr)
+    return by_size
+
+
+def build_duplicate_groups(
+    by_size: dict[int, list[Path]],
+    ignore_hardlinks: bool,
+) -> dict[str, list[Path]]:
+
+    size_candidates = {size: files for size, files in by_size.items() if len(files) > 1}
+
+    partial_groups: DefaultDict[str, list[Path]] = defaultdict(list)
+    for files in size_candidates.values():
+        for path in files:
+            try:
+                partial_groups[partial_hash(path)].append(path)
+            except OSError:
+                pass
+
+    full_groups: DefaultDict[str, list[Path]] = defaultdict(list)
+    for files in partial_groups.values():
+        if len(files) < 2:
+            continue
+        for path in files:
+            try:
+                full_groups[sha256_file(path)].append(path)
+            except OSError:
+                pass
+
+    verified: dict[str, list[Path]] = {}
+    for digest, files in full_groups.items():
+        if len(files) < 2:
+            continue
+
+        reference = files[0]
+        confirmed = [reference]
+
+        for candidate in files[1:]:
+            try:
+                if ignore_hardlinks:
+                    s1, s2 = reference.stat(), candidate.stat()
+                    if s1.st_dev == s2.st_dev and s1.st_ino == s2.st_ino:
+                        continue
+
+                if filecmp.cmp(reference, candidate, shallow=False):
+                    confirmed.append(candidate)
+
+            except OSError:
+                pass
+
+        if len(confirmed) > 1:
+            verified[digest] = confirmed
+
+    return verified
+
+
+def filter_groups(groups: dict[str, list[Path]], mode: str, case_sensitive: bool):
+    results = []
+
+    for digest, files in groups.items():
+        names = {p.name for p in files} if case_sensitive else {p.name.lower() for p in files}
+
+        if mode == "diff" and len(names) == 1:
+            continue
+        if mode == "same" and len(names) > 1:
+            continue
+
+        try:
+            size = files[0].stat().st_size
+        except OSError:
+            size = 0
+
+        results.append({
+            "hash": digest,
+            "size": size,
+            "files": sorted(str(p) for p in files),
+        })
+
+    results.sort(key=lambda x: x["size"], reverse=True)
+    return results
+
+
+def print_groups(groups):
+    for idx, group in enumerate(groups, start=1):
+        print(f"\n── Group {idx} (sha256: {group['hash'][:12]}… | size: {group['size']:,} bytes) ──")
+        for path in group["files"]:
+            print(f"   {path}")
+    print(f"\nTotal: {len(groups)} group(s).")
+
+
+def export_csv(groups, filename):
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["group", "sha256", "size_bytes", "filepath"])
+        for idx, group in enumerate(groups, start=1):
+            for path in group["files"]:
+                writer.writerow([idx, group["hash"], group["size"], path])
+    print(f"CSV written to {filename}", file=sys.stderr)
+
+
+def export_json(groups, filename):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(groups, f, indent=2, ensure_ascii=False)
+    print(f"JSON written to {filename}", file=sys.stderr)
+
+
+def interactive_delete(groups, dry_run):
+    if dry_run:
+        print("[dry-run] No files will be deleted.\n", file=sys.stderr)
+
+    for idx, group in enumerate(groups, start=1):
+        print(f"\n── Group {idx} (sha256: {group['hash'][:12]}… | size: {group['size']:,} bytes) ──")
+        for i, path in enumerate(group["files"], start=1):
+            print(f"  {i}) {path}")
+        print("  0) Skip")
+
+        while True:
+            answer = input(f"Keep which file? [0–{len(group['files'])}]: ").strip()
+            if answer.isdigit() and 0 <= int(answer) <= len(group["files"]):
+                value = int(answer)
+                break
+            print("  Invalid input, try again.")
+
+        if value == 0:
+            print("  Skipped.")
+            continue
+
+        keep = group["files"][value - 1]
+        for path in group["files"]:
+            if path == keep:
+                continue
+            if dry_run:
+                print(f"  [dry-run] Would delete: {path}")
+            else:
+                try:
+                    os.remove(path)
+                    print(f"  Deleted: {path}")
+                except OSError as exc:
+                    print(exc, file=sys.stderr)
+        print(f"  {'Would keep' if dry_run else 'Kept'}:    {keep}")
+
+
+EPILOG = """
+output modes (mutually exclusive, default: --diff-names):
+  --diff-names    only groups where filenames differ
+  --same-names    only groups where every copy has the same filename
+  --all           every duplicate group regardless of filename
+
+examples:
+  Basic scan (default: diff-names):
+    python dupename.py /photos /backup
+
+  Show ALL duplicates across two directories:
+    python dupename.py /photos /backup --all
+
+  Only duplicates whose copies share the same filename:
+    python dupename.py /photos /backup --same-names
+
+  Skip venv/.git folders:
+    python dupename.py /projects --exclude venv .venv .git
+
+  Only JPEG/PNG files larger than 1 MB:
+    python dupename.py /photos --ext jpg png --min-size 1048576
+
+  Only files smaller than 10 KB:
+    python dupename.py /docs --max-size 10240
+
+  Export to CSV and JSON simultaneously:
+    python dupename.py /photos --csv report.csv --json report.json
+
+  Preview what would be deleted (dry-run):
+    python dupename.py /photos --dry-run
+
+  Interactively choose which copy to keep:
+    python dupename.py /photos --delete-interactive
+
+  Same, but preview without actually deleting:
+    python dupename.py /photos --delete-interactive --dry-run
+
+  Treat hardlinks as duplicates (skipped by default):
+    python dupename.py /data --keep-hardlinks
+
+  Follow symlinks during scan:
+    python dupename.py /data --follow-symlinks
+
+  Case-sensitive filename comparison:
+    python dupename.py /data --diff-names --case-sensitive
+"""
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Find duplicate files and filter by filename.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("roots", nargs="+", help="Directories to scan")
+
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--all",        action="store_const", dest="mode", const="all",  help="Show all duplicate groups")
+    mode.add_argument("--diff-names", action="store_const", dest="mode", const="diff", help="Only duplicates with different filenames (default)")
+    mode.add_argument("--same-names", action="store_const", dest="mode", const="same", help="Only duplicates with identical filenames")
+
+    parser.add_argument("--case-sensitive",   action="store_true", help="Compare filenames case-sensitively")
+    parser.add_argument("--exclude", "-e",    nargs="*", default=[], metavar="DIR",   help="Directory names to exclude")
+    parser.add_argument("--follow-symlinks",  action="store_true",                    help="Follow symbolic links during scan")
+    parser.add_argument("--keep-hardlinks",   action="store_true",                    help="Treat hardlinks as duplicates")
+    parser.add_argument("--min-size",         type=int, metavar="BYTES",              help="Skip files smaller than this")
+    parser.add_argument("--max-size",         type=int, metavar="BYTES",              help="Skip files larger than this")
+    parser.add_argument("--ext",              nargs="*", metavar="EXT",               help="Only include these extensions (e.g. jpg png pdf)")
+    parser.add_argument("--csv",              metavar="FILE",                          help="Write results to CSV file")
+    parser.add_argument("--json",             metavar="FILE",                          help="Write results to JSON file")
+    parser.add_argument("--delete-interactive", action="store_true",                  help="Prompt which copy to keep, delete the rest")
+    parser.add_argument("--dry-run",            action="store_true",                  help="Simulate --delete-interactive without deleting anything")
+
+    args = parser.parse_args()
+    if args.mode is None:
+        args.mode = "diff"
+    return args
+
+
+def main():
+    args = parse_args()
+
+    extensions = {e.lower().lstrip(".") for e in args.ext} if args.ext else None
+
+    by_size = scan_files(
+        roots=args.roots,
+        exclude_dirs=set(args.exclude),
+        follow_symlinks=args.follow_symlinks,
+        min_size=args.min_size,
+        max_size=args.max_size,
+        extensions=extensions,
+    )
+
+    duplicates = build_duplicate_groups(by_size, ignore_hardlinks=not args.keep_hardlinks)
+    groups = filter_groups(duplicates, args.mode, args.case_sensitive)
+
+    if not groups:
+        print("No matching duplicates found.")
+        return
+
+    # CSV and JSON always run if requested, regardless of other flags
+    if args.csv:
+        export_csv(groups, args.csv)
+    if args.json:
+        export_json(groups, args.json)
+
+    if args.delete_interactive or args.dry_run:
+        interactive_delete(groups, args.dry_run)
+    elif not args.csv and not args.json:
+        print_groups(groups)
+
+
+if __name__ == "__main__":
+    main()
