@@ -6,7 +6,6 @@ Detection is done in three passes to minimise disk reads:
   1. Group by file size  (free – no I/O beyond stat)
   2. Partial SHA-256 of the first 64 KiB  (fast)
   3. Full SHA-256 of the entire file  (exact)
-Each confirmed duplicate pair is also verified byte-for-byte with filecmp.
 
 ────────────────────────────────────────────────────────────────────────────
 OUTPUT MODES  (mutually exclusive, default: --diff-names)
@@ -18,80 +17,97 @@ OUTPUT MODES  (mutually exclusive, default: --diff-names)
 ────────────────────────────────────────────────────────────────────────────
 EXAMPLES
 ────────────────────────────────────────────────────────────────────────────
-Basic scan (default mode: diff-names):
+  Basic scan (default mode: diff-names):
     fdup /photos /backup
 
-Scan two directories, show ALL duplicates:
+  Scan two directories, show ALL duplicates:
     fdup /photos /backup --all
 
-Only duplicates whose copies share the same filename:
+  Only duplicates whose copies share the same filename:
     fdup /photos /backup --same-names
 
-Skip venv and .git folders:
+  Skip venv and .git folders:
     fdup /projects --exclude venv .venv .git
 
-Only JPEG/PNG files larger than 1 MB:
+  Only JPEG/PNG files larger than 1 MB:
     fdup /photos --ext jpg png --min-size 1048576
 
-Only files smaller than 10 KB:
+  Only files smaller than 10 KB:
     fdup /docs --max-size 10240
 
-Case-sensitive filename comparison:
+  Case-sensitive filename comparison:
     fdup /data --diff-names --case-sensitive
 
-Export to CSV and JSON at the same time:
+  Export to CSV and JSON at the same time:
     fdup /photos --csv report.csv --json report.json
 
-Preview what would be deleted without touching anything (dry-run):
+  Preview what would be deleted without touching anything (dry-run):
     fdup /photos --dry-run
 
-Interactively choose which copy to keep, delete the rest:
+  Interactively choose which copy to keep, delete the rest:
     fdup /photos --delete-interactive
 
-Same, but preview the choices first without deleting:
+  Same, but preview the choices first without deleting:
     fdup /photos --delete-interactive --dry-run
 
-Treat hardlinks as duplicates (they are skipped by default):
+  Treat hardlinks as duplicates (they are skipped by default):
     fdup /data --keep-hardlinks
 
 ────────────────────────────────────────────────────────────────────────────
 REQUIREMENTS
 ────────────────────────────────────────────────────────────────────────────
-Python 3.11+  –  no third-party libraries required.
+  Python 3.11+  –  no third-party libraries required.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import filecmp
 import hashlib
 import json
 import os
 import sys
-
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import DefaultDict
 
-
 PARTIAL_HASH_SIZE = 64 * 1024
+HASH_CHUNK_SIZE   = 1024 * 1024
+# Number of threads for parallel hashing. IO-bound workloads scale well
+# beyond CPU count; 16 is a reasonable cap for most storage setups.
+HASH_THREADS = min(16, (os.cpu_count() or 4) * 2)
 
 
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+# ── Hashing ────────────────────────────────────────────────────────────────
+
+def _hash(path: Path, partial: bool) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
-        while chunk := f.read(chunk_size):
-            h.update(chunk)
+        if partial:
+            h.update(f.read(PARTIAL_HASH_SIZE))
+        else:
+            while chunk := f.read(HASH_CHUNK_SIZE):
+                h.update(chunk)
     return h.hexdigest()
 
 
-def partial_hash(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        h.update(f.read(PARTIAL_HASH_SIZE))
-    return h.hexdigest()
+def _hash_many(paths: list[Path], partial: bool) -> dict[Path, str]:
+    """Hash a list of files in parallel. Returns {path: digest}."""
+    results: dict[Path, str] = {}
+    with ThreadPoolExecutor(max_workers=HASH_THREADS) as pool:
+        futures = {pool.submit(_hash, p, partial): p for p in paths}
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                results[path] = future.result()
+            except OSError:
+                pass
+    return results
 
+
+# ── Scanning ───────────────────────────────────────────────────────────────
 
 def scan_files(
     roots: list[str],
@@ -100,9 +116,13 @@ def scan_files(
     min_size: int | None,
     max_size: int | None,
     extensions: set[str] | None,
-) -> DefaultDict[int, list[Path]]:
-
-    by_size: DefaultDict[int, list[Path]] = defaultdict(list)
+) -> DefaultDict[int, list[tuple[Path, int]]]:
+    """
+    Walk roots and group (path, size) pairs by size.
+    Storing size alongside the path avoids redundant stat() calls later.
+    Uses os.scandir-based os.walk for maximum throughput.
+    """
+    by_size: DefaultDict[int, list[tuple[Path, int]]] = defaultdict(list)
     total = 0
 
     for root in roots:
@@ -110,143 +130,165 @@ def scan_files(
             dirnames[:] = [d for d in dirnames if d not in exclude_dirs]
 
             for filename in filenames:
-                path = Path(dirpath) / filename
-
+                p = Path(dirpath) / filename
                 try:
-                    if not follow_symlinks and path.is_symlink():
+                    if not follow_symlinks and p.is_symlink():
+                        continue
+                    if extensions and p.suffix.lower().lstrip(".") not in extensions:
                         continue
 
-                    if extensions:
-                        if path.suffix.lower().lstrip(".") not in extensions:
-                            continue
-
-                    size = path.stat().st_size
+                    size = p.stat().st_size  # one stat per file, result is reused
 
                     if min_size is not None and size < min_size:
                         continue
-
                     if max_size is not None and size > max_size:
                         continue
 
-                    by_size[size].append(path)
+                    by_size[size].append((p, size))
                     total += 1
-
                 except OSError:
                     continue
 
-    print(f"Scanned {total:,} files.", file=sys.stderr)
-    return by_size
+    return by_size, total
 
+
+# ── Duplicate detection ────────────────────────────────────────────────────
 
 def build_duplicate_groups(
-    by_size: dict[int, list[Path]],
+    by_size: DefaultDict[int, list[tuple[Path, int]]],
     ignore_hardlinks: bool,
-) -> dict[str, list[Path]]:
+) -> dict[str, list[tuple[Path, int]]]:
+    """
+    Three-pass approach:
+      1. Size grouping (already done by scan_files)
+      2. Parallel partial hash of first 64 KiB
+      3. Parallel full SHA-256 only for partial-hash matches
 
-    size_candidates = {size: files for size, files in by_size.items() if len(files) > 1}
+    filecmp.cmp() is intentionally omitted: SHA-256 collisions are
+    computationally infeasible, so the byte-for-byte check adds I/O
+    without meaningful safety benefit at this scale.
+    """
+    # Pass 1 – keep only sizes with more than one file
+    size_candidates = [
+        (p, size)
+        for entries in by_size.values() if len(entries) > 1
+        for p, size in entries
+    ]
 
-    partial_groups: DefaultDict[str, list[Path]] = defaultdict(list)
-    for files in size_candidates.values():
-        for path in files:
-            try:
-                partial_groups[partial_hash(path)].append(path)
-            except OSError:
-                pass
+    if not size_candidates:
+        return {}, 0, 0
 
-    full_groups: DefaultDict[str, list[Path]] = defaultdict(list)
-    for files in partial_groups.values():
-        if len(files) < 2:
+    total_candidates = len(size_candidates)
+
+    # Pass 2 – partial hash in parallel
+    partial_digests = _hash_many([p for p, _ in size_candidates], partial=True)
+
+    partial_groups: DefaultDict[str, list[tuple[Path, int]]] = defaultdict(list)
+    size_map = {p: size for p, size in size_candidates}
+    for path, digest in partial_digests.items():
+        partial_groups[digest].append((path, size_map[path]))
+
+    # Pass 3 – full hash only for partial-hash collisions
+    full_candidates = [p for entries in partial_groups.values() if len(entries) > 1 for p, _ in entries]
+    if not full_candidates:
+        return {}, total_candidates, 0
+
+    full_digests = _hash_many(full_candidates, partial=False)
+
+    full_groups: DefaultDict[str, list[tuple[Path, int]]] = defaultdict(list)
+    for path, digest in full_digests.items():
+        full_groups[digest].append((path, size_map[path]))
+
+    # Filter hardlinks and require at least two distinct files
+    verified: dict[str, list[tuple[Path, int]]] = {}
+    for digest, entries in full_groups.items():
+        if len(entries) < 2:
             continue
-        for path in files:
-            try:
-                full_groups[sha256_file(path)].append(path)
-            except OSError:
-                pass
 
-    verified: dict[str, list[Path]] = {}
-    for digest, files in full_groups.items():
-        if len(files) < 2:
-            continue
+        if ignore_hardlinks:
+            # Deduplicate by (device, inode) to skip hardlinks
+            seen_inodes: set[tuple[int, int]] = set()
+            deduped: list[tuple[Path, int]] = []
+            for p, size in entries:
+                try:
+                    st = p.stat()
+                    key = (st.st_dev, st.st_ino)
+                    if key not in seen_inodes:
+                        seen_inodes.add(key)
+                        deduped.append((p, size))
+                except OSError:
+                    pass
+            entries = deduped
 
-        reference = files[0]
-        confirmed = [reference]
+        if len(entries) >= 2:
+            verified[digest] = entries
 
-        for candidate in files[1:]:
-            try:
-                if ignore_hardlinks:
-                    s1, s2 = reference.stat(), candidate.stat()
-                    if s1.st_dev == s2.st_dev and s1.st_ino == s2.st_ino:
-                        continue
-
-                if filecmp.cmp(reference, candidate, shallow=False):
-                    confirmed.append(candidate)
-
-            except OSError:
-                pass
-
-        if len(confirmed) > 1:
-            verified[digest] = confirmed
-
-    return verified
+    return verified, total_candidates, len(full_candidates)
 
 
-def filter_groups(groups: dict[str, list[Path]], mode: str, case_sensitive: bool):
+# ── Filtering ──────────────────────────────────────────────────────────────
+
+def filter_groups(
+    groups: dict[str, list[tuple[Path, int]]],
+    mode: str,
+    case_sensitive: bool,
+) -> list[dict]:
     results = []
-
-    for digest, files in groups.items():
-        names = {p.name for p in files} if case_sensitive else {p.name.lower() for p in files}
+    for digest, entries in groups.items():
+        if case_sensitive:
+            names = {p.name for p, _ in entries}
+        else:
+            names = {p.name.lower() for p, _ in entries}
 
         if mode == "diff" and len(names) == 1:
             continue
         if mode == "same" and len(names) > 1:
             continue
 
-        try:
-            size = files[0].stat().st_size
-        except OSError:
-            size = 0
-
+        size = entries[0][1]  # already stored, no extra stat()
         results.append({
-            "hash": digest,
-            "size": size,
-            "files": sorted(str(p) for p in files),
+            "hash":  digest,
+            "size":  size,
+            "files": sorted(str(p) for p, _ in entries),
         })
 
     results.sort(key=lambda x: x["size"], reverse=True)
     return results
 
 
-def print_groups(groups):
-    for idx, group in enumerate(groups, start=1):
+# ── Output ─────────────────────────────────────────────────────────────────
+
+def print_groups(groups: list[dict]) -> None:
+    for idx, group in enumerate(groups, 1):
         print(f"\n── Group {idx} (sha256: {group['hash'][:12]}… | size: {group['size']:,} bytes) ──")
         for path in group["files"]:
             print(f"   {path}")
     print(f"\nTotal: {len(groups)} group(s).")
 
 
-def export_csv(groups, filename):
+def export_csv(groups: list[dict], filename: str) -> None:
     with open(filename, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["group", "sha256", "size_bytes", "filepath"])
-        for idx, group in enumerate(groups, start=1):
+        w = csv.writer(f)
+        w.writerow(["group", "sha256", "size_bytes", "filepath"])
+        for idx, group in enumerate(groups, 1):
             for path in group["files"]:
-                writer.writerow([idx, group["hash"], group["size"], path])
+                w.writerow([idx, group["hash"], group["size"], path])
     print(f"CSV written to {filename}", file=sys.stderr)
 
 
-def export_json(groups, filename):
+def export_json(groups: list[dict], filename: str) -> None:
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(groups, f, indent=2, ensure_ascii=False)
     print(f"JSON written to {filename}", file=sys.stderr)
 
 
-def interactive_delete(groups, dry_run):
+def interactive_delete(groups: list[dict], dry_run: bool) -> None:
     if dry_run:
         print("[dry-run] No files will be deleted.\n", file=sys.stderr)
 
-    for idx, group in enumerate(groups, start=1):
+    for idx, group in enumerate(groups, 1):
         print(f"\n── Group {idx} (sha256: {group['hash'][:12]}… | size: {group['size']:,} bytes) ──")
-        for i, path in enumerate(group["files"], start=1):
+        for i, path in enumerate(group["files"], 1):
             print(f"  {i}) {path}")
         print("  0) Skip")
 
@@ -276,11 +318,9 @@ def interactive_delete(groups, dry_run):
         print(f"  {'Would keep' if dry_run else 'Kept'}:    {keep}")
 
 
-# Use the module docstring as the argparse epilog to avoid duplication
-EPILOG = __doc__
+# ── Argument parsing ───────────────────────────────────────────────────────
 
-
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Find duplicate files and filter by filename.",
         epilog=__doc__,
@@ -293,17 +333,18 @@ def parse_args():
     mode.add_argument("--diff-names", action="store_const", dest="mode", const="diff", help="Only duplicates with different filenames (default)")
     mode.add_argument("--same-names", action="store_const", dest="mode", const="same", help="Only duplicates with identical filenames")
 
-    parser.add_argument("--case-sensitive",   action="store_true", help="Compare filenames case-sensitively")
-    parser.add_argument("--exclude", "-e",    nargs="*", default=[], metavar="DIR",   help="Directory names to exclude")
-    parser.add_argument("--follow-symlinks",  action="store_true",                    help="Follow symbolic links during scan")
-    parser.add_argument("--keep-hardlinks",   action="store_true",                    help="Treat hardlinks as duplicates")
-    parser.add_argument("--min-size",         type=int, metavar="BYTES",              help="Skip files smaller than this")
-    parser.add_argument("--max-size",         type=int, metavar="BYTES",              help="Skip files larger than this")
-    parser.add_argument("--ext",              nargs="*", metavar="EXT",               help="Only include these extensions (e.g. jpg png pdf)")
-    parser.add_argument("--csv",              metavar="FILE",                          help="Write results to CSV file")
-    parser.add_argument("--json",             metavar="FILE",                          help="Write results to JSON file")
-    parser.add_argument("--delete-interactive", action="store_true",                  help="Prompt which copy to keep, delete the rest")
-    parser.add_argument("--dry-run",            action="store_true",                  help="Simulate --delete-interactive without deleting anything")
+    parser.add_argument("--case-sensitive",      action="store_true",            help="Compare filenames case-sensitively")
+    parser.add_argument("--exclude", "-e",       nargs="*", default=[], metavar="DIR",  help="Directory names to exclude")
+    parser.add_argument("--follow-symlinks",     action="store_true",            help="Follow symbolic links during scan")
+    parser.add_argument("--keep-hardlinks",      action="store_true",            help="Treat hardlinks as duplicates")
+    parser.add_argument("--min-size",            type=int, metavar="BYTES",      help="Skip files smaller than this")
+    parser.add_argument("--max-size",            type=int, metavar="BYTES",      help="Skip files larger than this")
+    parser.add_argument("--ext",                 nargs="*", metavar="EXT",       help="Only include these extensions (e.g. jpg png pdf)")
+    parser.add_argument("--csv",                 metavar="FILE",                 help="Write results to CSV file")
+    parser.add_argument("--json",                metavar="FILE",                 help="Write results to JSON file")
+    parser.add_argument("--delete-interactive",  action="store_true",            help="Prompt which copy to keep, delete the rest")
+    parser.add_argument("--dry-run",             action="store_true",            help="Simulate --delete-interactive without deleting anything")
+    parser.add_argument("--threads",             type=int, default=HASH_THREADS, metavar="N", help=f"Hashing threads (default: {HASH_THREADS})")
 
     args = parser.parse_args()
     if args.mode is None:
@@ -311,12 +352,34 @@ def parse_args():
     return args
 
 
-def main():
+# ── Entry point ────────────────────────────────────────────────────────────
+
+def _fmt(seconds: float) -> str:
+    """Format a duration as e.g. '1m 23.4s' or '4.2s'."""
+    if seconds >= 60:
+        m, s = divmod(seconds, 60)
+        return f"{int(m)}m {s:.1f}s"
+    return f"{seconds:.1f}s"
+
+
+def main() -> None:
     args = parse_args()
+    global HASH_THREADS
+    HASH_THREADS = args.threads
 
     extensions = {e.lower().lstrip(".") for e in args.ext} if args.ext else None
 
-    by_size = scan_files(
+    # Validate roots before doing any work
+    bad_roots = [r for r in args.roots if not os.path.isdir(r)]
+    if bad_roots:
+        for r in bad_roots:
+            print(f"Error: not a directory: {r}", file=sys.stderr)
+        sys.exit(1)
+
+    t_total = time.monotonic()
+
+    t0 = time.monotonic()
+    by_size, total_files = scan_files(
         roots=args.roots,
         exclude_dirs=set(args.exclude),
         follow_symlinks=args.follow_symlinks,
@@ -324,24 +387,31 @@ def main():
         max_size=args.max_size,
         extensions=extensions,
     )
+    t_scan = time.monotonic() - t0
 
-    duplicates = build_duplicate_groups(by_size, ignore_hardlinks=not args.keep_hardlinks)
+    t0 = time.monotonic()
+    duplicates, n_partial, n_full = build_duplicate_groups(by_size, ignore_hardlinks=not args.keep_hardlinks)
+    t_hash = time.monotonic() - t0
+
     groups = filter_groups(duplicates, args.mode, args.case_sensitive)
+    t_total = time.monotonic() - t_total
 
     if not groups:
         print("No matching duplicates found.")
-        return
+    else:
+        if args.csv:
+            export_csv(groups, args.csv)
+        if args.json:
+            export_json(groups, args.json)
 
-    # CSV and JSON always run if requested, regardless of other flags
-    if args.csv:
-        export_csv(groups, args.csv)
-    if args.json:
-        export_json(groups, args.json)
+        if args.delete_interactive or args.dry_run:
+            interactive_delete(groups, args.dry_run)
+        elif not args.csv and not args.json:
+            print_groups(groups)
 
-    if args.delete_interactive or args.dry_run:
-        interactive_delete(groups, args.dry_run)
-    elif not args.csv and not args.json:
-        print_groups(groups)
+    print(f"\nScanned {total_files:,} files in {_fmt(t_scan)}", file=sys.stderr)
+    print(f"Partial-hashed {n_partial:,} candidates, full-hashed {n_full:,}", file=sys.stderr)
+    print(f"Total time: {_fmt(t_total)}", file=sys.stderr)
 
 
 if __name__ == "__main__":
