@@ -276,58 +276,14 @@ def interactive_delete(groups, dry_run):
         print(f"  {'Would keep' if dry_run else 'Kept'}:    {keep}")
 
 
-EPILOG = """
-output modes (mutually exclusive, default: --diff-names):
-  --diff-names    only groups where filenames differ
-  --same-names    only groups where every copy has the same filename
-  --all           every duplicate group regardless of filename
-
-examples:
-  Basic scan (default: diff-names):
-    fdup /photos /backup
-
-  Show ALL duplicates across two directories:
-    fdup /photos /backup --all
-
-  Only duplicates whose copies share the same filename:
-    fdup /photos /backup --same-names
-
-  Skip venv/.git folders:
-    fdup /projects --exclude venv .venv .git
-
-  Only JPEG/PNG files larger than 1 MB:
-    fdup /photos --ext jpg png --min-size 1048576
-
-  Only files smaller than 10 KB:
-    fdup /docs --max-size 10240
-
-  Export to CSV and JSON simultaneously:
-    fdup /photos --csv report.csv --json report.json
-
-  Preview what would be deleted (dry-run):
-    fdup /photos --dry-run
-
-  Interactively choose which copy to keep:
-    fdup /photos --delete-interactive
-
-  Same, but preview without actually deleting:
-    fdup /photos --delete-interactive --dry-run
-
-  Treat hardlinks as duplicates (skipped by default):
-    fdup /data --keep-hardlinks
-
-  Follow symlinks during scan:
-    fdup /data --follow-symlinks
-
-  Case-sensitive filename comparison:
-    fdup /data --diff-names --case-sensitive
-"""
+# Use the module docstring as the argparse epilog to avoid duplication
+EPILOG = __doc__
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Find duplicate files and filter by filename.",
-        epilog=EPILOG,
+        epilog=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("roots", nargs="+", help="Directories to scan")
