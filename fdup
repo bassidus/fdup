@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dupename.py – find duplicate files, optionally filtered by filename.
+fdup – find duplicate files, optionally filtered by filename.
 
 Detection is done in three passes to minimise disk reads:
   1. Group by file size  (free – no I/O beyond stat)
@@ -19,40 +19,40 @@ OUTPUT MODES  (mutually exclusive, default: --diff-names)
 EXAMPLES
 ────────────────────────────────────────────────────────────────────────────
 Basic scan (default mode: diff-names):
-    python dupename.py /photos /backup
+    fdup /photos /backup
 
 Scan two directories, show ALL duplicates:
-    python dupename.py /photos /backup --all
+    fdup /photos /backup --all
 
 Only duplicates whose copies share the same filename:
-    python dupename.py /photos /backup --same-names
+    fdup /photos /backup --same-names
 
 Skip venv and .git folders:
-    python dupename.py /projects --exclude venv .venv .git
+    fdup /projects --exclude venv .venv .git
 
 Only JPEG/PNG files larger than 1 MB:
-    python dupename.py /photos --ext jpg png --min-size 1048576
+    fdup /photos --ext jpg png --min-size 1048576
 
 Only files smaller than 10 KB:
-    python dupename.py /docs --max-size 10240
+    fdup /docs --max-size 10240
 
 Case-sensitive filename comparison:
-    python dupename.py /data --diff-names --case-sensitive
+    fdup /data --diff-names --case-sensitive
 
 Export to CSV and JSON at the same time:
-    python dupename.py /photos --csv report.csv --json report.json
+    fdup /photos --csv report.csv --json report.json
 
 Preview what would be deleted without touching anything (dry-run):
-    python dupename.py /photos --dry-run
+    fdup /photos --dry-run
 
 Interactively choose which copy to keep, delete the rest:
-    python dupename.py /photos --delete-interactive
+    fdup /photos --delete-interactive
 
 Same, but preview the choices first without deleting:
-    python dupename.py /photos --delete-interactive --dry-run
+    fdup /photos --delete-interactive --dry-run
 
 Treat hardlinks as duplicates (they are skipped by default):
-    python dupename.py /data --keep-hardlinks
+    fdup /data --keep-hardlinks
 
 ────────────────────────────────────────────────────────────────────────────
 REQUIREMENTS
@@ -284,43 +284,43 @@ output modes (mutually exclusive, default: --diff-names):
 
 examples:
   Basic scan (default: diff-names):
-    python dupename.py /photos /backup
+    fdup /photos /backup
 
   Show ALL duplicates across two directories:
-    python dupename.py /photos /backup --all
+    fdup /photos /backup --all
 
   Only duplicates whose copies share the same filename:
-    python dupename.py /photos /backup --same-names
+    fdup /photos /backup --same-names
 
   Skip venv/.git folders:
-    python dupename.py /projects --exclude venv .venv .git
+    fdup /projects --exclude venv .venv .git
 
   Only JPEG/PNG files larger than 1 MB:
-    python dupename.py /photos --ext jpg png --min-size 1048576
+    fdup /photos --ext jpg png --min-size 1048576
 
   Only files smaller than 10 KB:
-    python dupename.py /docs --max-size 10240
+    fdup /docs --max-size 10240
 
   Export to CSV and JSON simultaneously:
-    python dupename.py /photos --csv report.csv --json report.json
+    fdup /photos --csv report.csv --json report.json
 
   Preview what would be deleted (dry-run):
-    python dupename.py /photos --dry-run
+    fdup /photos --dry-run
 
   Interactively choose which copy to keep:
-    python dupename.py /photos --delete-interactive
+    fdup /photos --delete-interactive
 
   Same, but preview without actually deleting:
-    python dupename.py /photos --delete-interactive --dry-run
+    fdup /photos --delete-interactive --dry-run
 
   Treat hardlinks as duplicates (skipped by default):
-    python dupename.py /data --keep-hardlinks
+    fdup /data --keep-hardlinks
 
   Follow symlinks during scan:
-    python dupename.py /data --follow-symlinks
+    fdup /data --follow-symlinks
 
   Case-sensitive filename comparison:
-    python dupename.py /data --diff-names --case-sensitive
+    fdup /data --diff-names --case-sensitive
 """
 
 
