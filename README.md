@@ -67,6 +67,21 @@ fdup /photos
 ```
 This lets you use the same name as on Linux/macOS.
 
+### Global access (run from anywhere)
+
+Windows does not have a default user binary directory like Linux, so the best practice is to create your own:
+
+1. Create a dedicated folder for your CLI tools, e.g. `C:\bin`
+2. Move both `fdup` and `fdup.bat` into that folder
+3. Add `C:\bin` to your `PATH`:
+   - Search for **Environment Variables** in the Start Menu
+   - Click **Environment Variables...**
+   - Under **User variables**, select **Path** and click **Edit...**
+   - Click **New** and type `C:\bin`
+   - Click **OK** and restart your terminal
+
+Now you can run `fdup /photos` from any directory.
+
 ---
 
 ## Usage
